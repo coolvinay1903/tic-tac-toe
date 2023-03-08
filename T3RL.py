@@ -6,64 +6,63 @@ from __future__ import print_function
 
 import warnings
 from builtins import iter
-
-import tf_agents
-from tf_agents.system import system_multiprocessing
+import argparse
 from absl import app
 import os
-import logging
 import time
-import numpy as np
 from tf_agents.environments import tf_py_environment
 from tf_agents.drivers import dynamic_episode_driver
 from tf_agents.metrics import tf_metrics
 from tf_agents.eval import metric_utils
-from tf_agents.drivers import py_driver
-from tf_agents.trajectories import trajectory
-from tf_agents.agents import PPOAgent
 from tf_agents.agents.dqn import dqn_agent
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.utils import common
 from tf_agents.policies import policy_saver
-from tf_agents.utils import composite
-from tf_agents.utils import nest_utils
-from tf_agents.networks import sequential
 import tensorflow as tf
-from tensorflow.python.eager.context import eager_mode, graph_mode
+from tensorflow.python.eager.context import eager_mode
 from policy_network import ActorNet
 from T3Env import T3Env
+from T3NashEnv import T3NashEnv
 
-import logging
-
-logging.basicConfig(level=logging.INFO)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+from Logger import create_logger
+
+
+def get_logger(name):
+    return create_logger(name)
 
 
 def create_networks(tf_env):
     fc_layer_params = (10, 5)
     policy_net = ActorNet(
-        tf_env.observation_spec()['state'], tf_env.action_spec(), fc_layer_params=fc_layer_params
+        tf_env.observation_spec()["state"],
+        tf_env.action_spec(),
+        fc_layer_params=fc_layer_params,
     )
     return policy_net
 
 
-def create_envs(board_size):
-    train_py_env = T3Env(board_size, name="train")
-    eval_py_env = T3Env(board_size, name="eval")
+def create_envs(board_size, nash, logger):
+    env = T3NashEnv if nash else T3Env
+    train_py_env = env(board_size, name="train", logger=logger)
+    eval_py_env = env(board_size, name="eval", logger=logger, verbose=True)
 
     eval_env = tf_py_environment.TFPyEnvironment(eval_py_env)
     train_env = tf_py_environment.TFPyEnvironment(train_py_env)
     return train_env, eval_env
 
 
-def train_eval_t3():
+def train_eval_t3(args):
 
+    nash = args["nash"]
+    train = args["train"]
+    eval_ = args["evaluate"]
     num_parallel_envs = 1
     num_train_epochs = 25
-    num_iterations = 1000000
+    num_iterations = 10000 if train else 0
     summary_interval = num_train_epochs
     checkpoint_interval = num_train_epochs * 10
-    num_eval_episodes = 1  # @param
+    num_eval_episodes = 1 if train else 5  # @param
     eval_interval = num_parallel_envs * num_train_epochs * 2
     log_interval = num_train_epochs  # @param
     gamma = 0.99
@@ -71,6 +70,10 @@ def train_eval_t3():
     normalize_rewards = True
     profile_training = False
     batched_training = True
+    replay_buffer_capacity = 30000
+    batch_size = 32
+
+    logger = get_logger("Nash") if nash else get_logger("RandomPolicy")
 
     if batched_training:
         num_training_batches = 1
@@ -80,20 +83,36 @@ def train_eval_t3():
 
     # Create directories for plots, logs, graphs, tensorboard data
     root_dir = os.path.expanduser(os.getcwd())
-    log_dir = os.path.join(root_dir, "logs_new")
+    tag = "self_play" if nash else "random_other_player"
+    log_dir = os.path.join(root_dir, f"logs_{tag}")
     train_dir = os.path.join(log_dir, "train")
     eval_dir = os.path.join(log_dir, "eval")
     saved_model_dir = os.path.join(log_dir, "policy_saved_model")
 
     # create env here
-    train_env, eval_env = create_envs(9)
+    train_env, eval_env = create_envs(9, nash, logger)
+
+    if train:
+        logger.info("Training mode: ")
+        logger.info(f"Num training episodes: {num_iterations}")
+        if nash:
+            logger.info("\tSelf play: 1")
+        else:
+            logger.info("\tRandom policy for other player: 1")
+
+    if eval_:
+        logger.info("Evaluation mode: ")
+        if nash:
+            logger.info("\tSelf play: 1")
+        else:
+            logger.info("\tRandom policy for other player: 1")
 
     with eager_mode():
 
         # initialize globaql step
         global_step = tf.compat.v1.train.get_or_create_global_step()
 
-        # Initlialize metrics logging
+        # Initlialize metrics logger
         summaries_flush_secs = 10
         train_summary_writer = tf.compat.v2.summary.create_file_writer(
             train_dir, flush_millis=summaries_flush_secs * 1000
@@ -120,15 +139,17 @@ def train_eval_t3():
         ]
 
         policy_net = create_networks(train_env)
+
         def observation_and_action_constraint_splitter(observation):
-            return observation['state'], observation['mask']
+            return observation["state"], observation["mask"]
+
         tf_agent = dqn_agent.DqnAgent(
             train_env.time_step_spec(),
             train_env.action_spec(),
             q_network=policy_net,
+            target_update_period=10,
             observation_and_action_constraint_splitter=observation_and_action_constraint_splitter,
             optimizer=tf.keras.optimizers.Adam(learning_rate=5e-4),
-            td_errors_loss_fn=common.element_wise_squared_loss,
             debug_summaries=True,
             epsilon_greedy=0.1,
             train_step_counter=global_step,
@@ -149,7 +170,6 @@ def train_eval_t3():
             tf_metrics.AverageEpisodeLengthMetric(batch_size=env_batch_size),
         ]
 
-        replay_buffer_capacity = 30000
         replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
             tf_agent.collect_data_spec,
             batch_size=env_batch_size,
@@ -192,21 +212,15 @@ def train_eval_t3():
             collect_driver.run = common.function(collect_driver.run, autograph=True)
             tf_agent.train = common.function(tf_agent.train, autograph=True)
 
-        batch_size = 32
         dataset = replay_buffer.as_dataset(
             sample_batch_size=batch_size, num_steps=2
         ).prefetch(3)
         iterator = iter(dataset)
 
-        num_epochs = 10000
-
         collect_time = 0
         train_time = 0
         timed_at_step = global_step.numpy()
 
-        num_iterations = num_epochs
-        # num_iterations = num_epochs
-        # num_iterations = 2
         for _ in range(num_iterations):
 
             start_time = time.time()
@@ -226,25 +240,24 @@ def train_eval_t3():
                 )
 
             if step % log_interval == 0:
-                logging.info("step = %d, loss = %f", step, train_loss)
+                logger.info("step = %d, loss = %f", step, train_loss)
                 steps_per_sec = (step - timed_at_step) / (collect_time + train_time)
-                logging.info("%.3f steps/sec", steps_per_sec)
-                logging.info(
+                logger.info("%.3f steps/sec", steps_per_sec)
+                logger.info(
                     "collect_time = {}, train_time = {}".format(
                         collect_time, train_time
                     )
                 )
 
-                with tf.compat.v2.summary.record_if(True):
-                    tf.compat.v2.summary.scalar(
-                        name="global_steps_per_sec",
-                        data=steps_per_sec,
-                        step=global_step,
-                    )
+                tf.compat.v2.summary.scalar(
+                    name="global_steps_per_sec",
+                    data=steps_per_sec,
+                    step=global_step,
+                )
 
-                    timed_at_step = step
-                    collect_time = 0
-                    train_time = 0
+                timed_at_step = step
+                collect_time = 0
+                train_time = 0
 
             if step % eval_interval == 0 and step > 0:
                 print("Entering Evaluation phase")
@@ -260,13 +273,37 @@ def train_eval_t3():
 
         # one final evlauation
         evaluate()
+    if eval_:
+        evaluate()
 
 
-def main(_):
+def parse_args():
 
-    # logging.set_verbosity(logging.INFO)
-    train_eval_t3()
+    parser = argparse.ArgumentParser(
+        description="Process input arguments for RL tic-tac-toe.", add_help=True
+    )
+    parser.add_argument("-t", "--train", action="store_true", help="Train the RL agent")
+    parser.add_argument(
+        "-e", "--evaluate", action="store_true", help="Evaluate the RL agent"
+    )
+    parser.add_argument(
+        "-s", "--self_play", action="store_true", help="Train the agent for self-play"
+    )
+    args = parser.parse_args()
+    train = args.train
+    evaluate = args.evaluate
+    nash = args.self_play
+    return {
+        "train": train,
+        "evaluate": evaluate,
+        "nash": nash,
+    }
+
+
+def main(args):
+    train_eval_t3(args)
 
 
 if __name__ == "__main__":
-    app.run(main)
+    args = parse_args()
+    main(args)

@@ -11,20 +11,21 @@ from tf_agents.environments import py_environment
 from tf_agents.specs import array_spec
 from tf_agents.specs import tensor_spec
 from tf_agents.trajectories import time_step as ts
-import logging
+from Logger import create_logger
 
 
 class T3Env(py_environment.PyEnvironment):
-    def __init__(self, board_size=9, name="dummy", verbose=False):
+    def __init__(self, _board_size=9, logger=None, name="T3Env", verbose=False):
         """
         The gameboard will have 9 moves, odd moves for 'o' and even for 'x'
         """
         # Maintain a board data structure separate from the x,o,classical arrays
-        self._board_size = board_size
+        self._board_size = _board_size
         self._name = name
         self._verbose = verbose
-        log_level = logging.DEBUG if verbose else logging.INFO
-        logging.basicConfig(level=log_level)
+        self.logger = logger
+        if self.logger is None:
+            self.logger = create_logger(name)
 
         self._win_patterns = [
             [0, 1, 2],
@@ -110,7 +111,7 @@ class T3Env(py_environment.PyEnvironment):
             if pat_sum == -3:
                 self._winner = "O"
                 self._reward = -10
-        if self._iters == self._board_size-1:
+        if not self._winner and self._iters == self._board_size:
             self._winner = None
             self._reward = 5
         return self._reward != 0
@@ -134,11 +135,13 @@ class T3Env(py_environment.PyEnvironment):
 
     def _validate_and_play(self, move):
         if move not in range(0, self._board_size):
-            logging.debug(f"move {move} not in [0, {self._board_size})")
+            if self._verbose:
+                self.logger.debug(f"move {move} not in [0, {self._board_size})")
             return False
 
         if not self._mask[move]:
-            logging.debug(f"Board is already occupied at {move}")
+            if self._verbose:
+                self.logger.debug(f"Board is already occupied at {move}")
             return False
 
         self._play(move)
@@ -147,7 +150,10 @@ class T3Env(py_environment.PyEnvironment):
     def _make_move(self, move):
         self._board[move] = self._mark
         self._mask[move] = False
-        self._all_moves.append(f"I:{self._iters} P:{self._current_player} M:{move}")
+        this_move = f"I:{self._iters} P:{self._current_player} M:{move}"
+        self._all_moves.append(this_move)
+        if self._verbose:
+            self.logger.debug(f"Move: {this_move}")
         self._iters += 1
 
     def _play_random_move(self):
@@ -155,7 +161,7 @@ class T3Env(py_environment.PyEnvironment):
             return False
         move = np.random.choice([i for i, v in enumerate(self._mask) if v])
         self._make_move(move)
-        
+
         return True
 
     def _play(self, move):
@@ -179,11 +185,19 @@ class T3Env(py_environment.PyEnvironment):
         return observation
 
     def _step(self, action):
+        # If the episode has already ended just reset the env
+        if self._episode_ended:
+            return self._reset()
+
         if self._validate_and_play(action) and self._verbose:
             self.print_board()
         if self._episode_ended:
             reward = self._get_reward()
             self._state = self._get_state()
+            if self._verbose:
+                self.logger.debug(
+                    f"Game ended - I: {self._iters}, reward: {reward}, winning_player={self._winner}"
+                )
             return ts.termination(observation=self._state, reward=reward)
 
         # Episode is running
@@ -198,13 +212,13 @@ class T3Env(py_environment.PyEnvironment):
                 board[i] = "X "
             elif v == -1:
                 board[i] = "O "
-        logging.debug("_____________")
-        logging.debug(" {} | {} | {}".format(board[0], board[1], board[2]))
-        logging.debug("_____________")
-        logging.debug(" {} | {} | {}".format(board[3], board[4], board[5]))
-        logging.debug("_____________")
-        logging.debug(" {} | {} | {}".format(board[6], board[7], board[8]))
-        logging.debug("_____________")
+        self.logger.debug("_____________")
+        self.logger.debug(" {} | {} | {}".format(board[0], board[1], board[2]))
+        self.logger.debug("_____________")
+        self.logger.debug(" {} | {} | {}".format(board[3], board[4], board[5]))
+        self.logger.debug("_____________")
+        self.logger.debug(" {} | {} | {}".format(board[6], board[7], board[8]))
+        self.logger.debug("_____________")
 
 
 if __name__ == "__main__":
