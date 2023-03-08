@@ -205,6 +205,9 @@ class T3Env(py_environment.PyEnvironment):
         self._state = self._get_state()
         return ts.transition(observation=self._state, reward=reward, discount=0.9)
 
+    def iters(self):
+        return self._iters
+
     def print_board(self):
         board = ["--" for i in range(self._board_size)]
         for i, v in enumerate(self._board):
